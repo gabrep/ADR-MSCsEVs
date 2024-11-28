@@ -1,0 +1,772 @@
+---
+title: "GSE12683 - mice"
+author: "Gabriel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#Packages   
+```{r}
+library(tidyverse)
+library(GEOquery)
+library(limma)
+library(oligo)
+
+#Annotation
+library(affycoretools)
+library(pd.mouse430a.2)
+library(mouse430a2.db)
+
+#Clustering
+library(dendextend)
+library(FactoMineR); library(factoextra)
+
+#Plots
+library(EnhancedVolcano)
+library(pheatmap)
+
+#Enrichment
+library(clusterProfiler)
+library(enrichplot)
+library(GOplot)
+library(msigdbr)
+```
+
+#Data entry
+```{r}
+my_id <- "GSE12683"
+geo <- getGEO(my_id)
+
+gse <- geo[[1]]
+pd <- pData(gse)
+
+pd.male <- pd %>% filter(characteristics_ch1.1 %in% 'Male')
+
+pd.male['celfile'] <- str_split(pd.male$supplementary_file, '/') %>% map_chr(tail, 1)
+
+#Selecionar amostras também no gse
+gse.male <- gse[,rownames(pd.male)]
+
+gse_celdata <- read.celfiles(paste0('GSE12683_RAW/', pd.male$celfile), phenoData = phenoData(gse.male))
+#'pd.mouse430a.2'
+```
+
+##Annotation
+```{r}
+eset <- rma(gse_celdata)
+columns(mouse430a2.db)
+eset <- annotateEset(eset, mouse430a2.db, columns = c("PROBEID", "ENTREZID", "SYMBOL", "GENENAME", "ENSEMBL"))
+
+eset$data_row_count
+table(duplicated(fData(eset)$ENSEMBL))
+table(unique(fData(eset)$ENSEMBL))
+```
+
+##Remover duplos e NAs
+```{r}
+anno_gse <- eset@featureData@data
+
+anno_grouped <- group_by(anno_gse, PROBEID)
+anno_summ <- dplyr::summarize(anno_grouped, n_matches=n_distinct(SYMBOL))
+#SEM probes duplicadas
+
+#Remover NAs
+probes_na <- subset(anno_gse, !is.na(SYMBOL))
+probes_na <- featureNames(eset) %in% probes_na$PROBEID
+gse_final <- subset(eset, probes_na)
+
+fData(gse_final)
+
+exp_gse <- exprs(gse_final)
+
+oligo::hist(exp_gse)
+oligo::hist(gse_final)
+```
+
+
+##Filtro baixas leituras
+```{r}
+gse_medians <- rowMedians(exp_gse)
+
+hist(gse_medians, 100, freq=F, col='cornsilk') 
+abline(v=4.7, col='red')
+
+threshold <- apply(gse_final, 1, function(x) {
+  sum(x > 4.7) >= 6 })
+
+table(threshold)
+
+eset_filtered <- subset(gse_final, threshold)
+exp_filtered <- exprs(eset_filtered)
+
+oligo::hist(eset_filtered)
+```
+
+#Remover GenesIDs duplos
+```{r}
+gene_ids <- fData(eset_filtered)
+table(duplicated(gene_ids$ENSEMBL))
+```
+
+#Clusterização
+```{r}
+pd.male$Grupo <- pd.male$characteristics_ch1 %>% str_split(" ") %>% map_chr(head, 1)
+
+ann <- dplyr::select(pd.male, Grupo)
+```
+
+##Dendograma
+```{r}
+dist <- dist(t(exp_filtered))
+hc <- hclust(dist)
+dend <- as.dendrogram(hc)
+
+
+dend %>% 
+  color_labels(labels = colnames(exp_filtered[,1:5]),
+               col='purple') %>% 
+  color_labels(labels = colnames(exp_filtered[,6:10]),
+               col='darkgreen') %>% 
+  plot()
+```
+
+##PCA
+```{r}
+pca <- PCA(t(exp_filtered), graph = F)
+
+fviz_pca_ind(pca,
+             mean.point=F,
+             geom=c('point', 'text'),
+             geom.ind=c('point', 'text'), pointshape=21, pointsize=3,
+             fill.ind=pd.male$Grupo,
+             addEllipses = T, ellipse.type='confidence')+
+    scale_fill_manual(values=c("purple", "darkgreen"))+
+  scale_color_manual(values=c("purple", "darkgreen"))
+```
+
+###Amostras a remover
+```{r}
+#Após verificar o dendograma e PCA, nota-se que as amostras GSM##27, GM##17, GSM##20, GM##26 não estão de acordo com o restante das amostras.
+which(rownames(pd.male) %in% c('GSM318527', 'GSM318517', 'GSM318520', 'GSM318526'))
+```
+
+#Amostras selecionadas
+```{r}
+cores <- c("#fe0131","#175290")
+```
+
+```{r}
+pd.selected <- pd.male[-c(2,5,6,7),]
+rownames(pd.selected)
+
+gse_selected <- gse_celdata[,rownames(pd.selected)]
+
+eset_selected <- rma(gse_selected)
+eset_selected <- annotateEset(eset_selected, mouse430a2.db, columns = c("PROBEID", "ENTREZID", "SYMBOL", "GENENAME", "ENSEMBL"))
+
+#Remover duplicados
+eset_selected@featureData@data$Nacc <- seq(from=1, to=nrow(eset_selected@featureData@data))
+eset_selected@featureData@data$Nacc
+
+eset_reduzido <- eset_selected
+rownames(eset_reduzido@featureData@data) <- eset_reduzido@featureData@data$Nacc
+eset_reduzido@featureData@data %>% head()
+eset_reduzido@assayData$exprs %>% rownames() %>% head()
+
+exp_reduzido <- exprs(eset_reduzido)
+exp_reduzido <- as.data.frame(exp_reduzido) %>% mutate(ENSEMBL = eset_reduzido@featureData@data$ENSEMBL)
+exp_reduzido$Nacc <- eset_selected@featureData@data$Nacc
+
+fData(eset_reduzido) <- fData(eset_reduzido) %>% dplyr::distinct(ENSEMBL, .keep_all = T)
+
+exp_reduzido <- exp_reduzido %>% group_by(ENSEMBL) %>% dplyr::summarise(across(1:6, mean))
+
+dim(exp_reduzido)
+dim(fData(eset_reduzido))
+dim(exprs(eset_reduzido))
+
+
+#Remover NAs
+probes_na <- subset(eset_selected@featureData@data, !is.na(SYMBOL))
+probes_na <- featureNames(eset_selected) %in% probes_na$PROBEID
+gse_final <- subset(eset_selected, probes_na)
+
+fData(gse_final) %>% head()
+
+exp_gse <- exprs(gse_final)
+
+oligo::hist(exp_gse)
+oligo::hist(gse_final)
+```
+
+##Filtro baixas leituras
+```{r}
+gse_medians <- rowMedians(exp_gse)
+
+hist(gse_medians, 100, freq=F, col='cornsilk') 
+abline(v=4.8, col='red')
+
+threshold <- apply(gse_final, 1, function(x) {
+  sum(x > 4.8) >= 4 })
+
+table(threshold)
+
+eset_filtered <- subset(gse_final, threshold)
+exp_filtered <- exprs(eset_filtered)
+
+oligo::hist(eset_filtered)
+```
+
+#Clusterização
+```{r}
+pd.selected$Grupo <- pd.selected$characteristics_ch1 %>% str_split(" ") %>% map_chr(head, 1)
+
+ann <- dplyr::select(pd.selected, Grupo)
+colnames(ann) <- "Mice"
+```
+
+##Dendograma
+```{r}
+dist <- dist(t(exp_filtered))
+hc <- hclust(dist)
+dend <- as.dendrogram(hc)
+
+
+dend %>% 
+  color_labels(labels = colnames(exp_filtered[,1:3]),
+               col=cores[2]) %>% 
+  color_labels(labels = colnames(exp_filtered[,4:6]),
+               col=cores[1]) %>% 
+  plot()
+
+legend("topright",
+       legend=c('Healthy', 'Diseased'),
+       col=cores[c(2,1)],
+       pch=c(20,20,20), bty = "n", pt.cex = 1.8, cex = .8, trace=T)
+```
+
+##PCA
+```{r}
+pca <- PCA(t(exp_filtered), graph = F)
+
+
+fviz_pca_ind(pca,
+             mean.point=F, title=" ",
+             geom=c('point', 'text'),
+             geom.ind=c('point', 'text'), pointshape=21, pointsize=3,
+             fill.ind=pd.selected$Grupo,
+             addEllipses = T, ellipse.type='confidence')+
+    scale_fill_manual(values=cores)+
+  scale_color_manual(values=cores)+
+  theme_classic()
+ggsave("Figuras/PCA.png", width = 6, height = 4, bg='white')
+```
+
+##Heatmap
+```{r}
+pheatmap(exp_filtered,
+         border_color = NA,
+         cluster_cols = T, #gaps_col = 4,
+         cluster_rows = T,
+         treeheight_row = 0,
+         color=colorRampPalette(c('#175290','#55a1fa', 'white','#fe0131', 'darkred'))(100),
+         #color=viridis::inferno(100),
+         #annotation_col = amostras.2,
+         #annotation_colors = list(Condition = c(DHF = cores_cba[3],
+                                                #DF = cores_cba[1])),
+         show_colnames = F,
+         show_rownames = F,
+         scale="row",
+         annotation_col = ann,
+         annotation_colors = list(Mice = c(Diseased = cores[1], Healthy = cores[2])))
+
+```
+
+#DEG
+```{r}
+gse_final %>% fData() %>% View()
+
+design <- model.matrix(~0+pd.selected$Grupo)
+colnames(design) <- levels(as.factor(pd.selected$Grupo))
+
+contrastMatrix <- makeContrasts(Diseased - Healthy, levels=colnames(design))
+contrastMatrix
+
+fit <- lmFit(gse_final, design)
+fit <- contrasts.fit(fit, contrasts = contrastMatrix)
+fit2 <- eBayes(fit)
+
+res <- topTable(fit2, number = Inf)
+
+summary(decideTests(fit2, lfc = 2, adjust.method = 'fdr', p.value = 0.05))
+```
+
+##Volcano
+```{r}
+keyvals <- ifelse(res$adj.P.Val >= 0.05, "gray",
+                  ifelse(res$logFC <= -2, cores[1],
+                         ifelse(res$logFC >= 2, cores[2], "gray")))
+
+keyvals[is.na(keyvals)] <- "gray"
+names(keyvals)[keyvals == cores[2]] <- "Up-regulated"
+names(keyvals)[keyvals == "gray"] <- "Not significant"
+names(keyvals)[keyvals == cores[1]] <- "Down-regulated"
+
+EnhancedVolcano(res,
+                lab=res$SYMBOL,
+                max.overlaps = Inf,
+                x="logFC", 
+                y="adj.P.Val",
+                colCustom = keyvals,
+                ylab = bquote(~-Log[10]~italic("Adjusted P-value")),
+                FCcutoff = 2,
+                pCutoff = 0.05,
+                pCutoffCol = "adj.P.Val",
+                title=NULL,
+                subtitle=NULL,
+                pointSize = 3, 
+                labSize = 4,
+                colAlpha = .8,
+                xlim=c(-5,7),
+                ylim=c(0,7))+
+  annotate("rect", xmin = -2, xmax = -Inf,
+           ymin = 1.3, ymax = Inf,
+           alpha = .1, fill = cores[1]) +
+  annotate("rect", xmin = 2, xmax = Inf,
+           ymin = 1.3, ymax = Inf,
+           alpha = .1, fill = cores[2])+
+  theme_classic()+
+  theme(legend.position = 'top',
+        legend.title = element_blank())
+
+ggsave("Figuras/Volcano_lFC20.png", width = 7, height = 5, bg='white')
+```
+
+```{r}
+res %>% filter(adj.P.Val <= 0.05 & abs(logFC) >= 2)
+
+res %>% mutate(reg=ifelse(logFC <= -1.5, "Down", ifelse(logFC >=1.5, 'Up', NA))) %>% 
+  filter(adj.P.Val <= .05) %>% na.omit() %>% 
+  ggplot(aes(reg, fill=reg))+
+  geom_bar(width = .75, stat="count")+
+  scale_fill_manual(values=cores[c(2,1)], guide='none')+
+  stat_count(geom = "text", colour = "white", size = 5, aes(label = ..count..), vjust=1.5)+
+  labs(x=NULL, y="Counts")+
+  theme_classic()+
+  coord_cartesian(xlim = c(0.5,2.5), expand = F, ylim = c(0,130))+
+  theme(axis.text = element_text(color='black', size=12))
+  
+ggsave('Figuras/Deg_counts(lFC15).png', width = 4, height = 4)
+```
+
+#Enriquecimento
+##Remover GeneIDs duplicados
+```{r}
+res.order.abs <- res %>% dplyr::arrange(dplyr::desc(abs(logFC))) %>% dplyr::distinct(SYMBOL, .keep_all=T)
+
+res.order <- res[order(res$logFC, decreasing = T),] %>% as.data.frame()
+
+res.order <- res.order.abs %>% dplyr::arrange(dplyr::desc(logFC))
+```
+
+##GSEA
+```{r}
+ranks <- res.order$logFC
+names(ranks) <- res.order$SYMBOL
+
+term2gene.H <- msigdbr(species="Mus musculus", category = "H") %>% dplyr::select(gs_name, gene_symbol)
+gsea.H <- GSEA(ranks, TERM2GENE = term2gene.H)
+gsea.res.H <- gsea.H@result
+
+term2gene.C2 <- msigdbr(species="Mus musculus", category = "C2") %>% dplyr::select(gs_name, gene_symbol)
+gsea.C2 <- GSEA(ranks, TERM2GENE = term2gene.C2)
+gsea.res.C2 <- gsea.C2@result
+
+
+term2gene.C3 <- msigdbr(species="Mus musculus", category = "C3") %>% dplyr::select(gs_name, gene_symbol)
+gsea.C3 <- GSEA(ranks, TERM2GENE = term2gene.C3)
+gsea.res.C3 <- gsea.C3@result
+```
+
+
+```{r}
+ridgeplot(gsea.H, showCategory = 20)
+
+hallmark.tgfb <- filter(gsea.res.H, ID == "HALLMARK_TGF_BETA_SIGNALING") %>% select(core_enrichment) %>%
+  mutate(core_enrichment = as.list(strsplit(core_enrichment, "/")))
+hallmark.tgfb <- as.data.frame(hallmark.tgfb[[1]]) %>% mutate(Hallmark = "TGFb") %>% dplyr::rename(Genes=1)
+
+hallmark.apoptosis <- filter(gsea.res.H, ID == "HALLMARK_APOPTOSIS") %>% select(core_enrichment) %>%
+  mutate(core_enrichment = as.list(strsplit(core_enrichment, "/")))
+hallmark.apoptosis <- as.data.frame(hallmark.apoptosis[[1]]) %>% mutate(Hallmark = "Apoptosis") %>% dplyr::rename(Genes=1)
+
+hallmark.tnfa <- filter(gsea.res.H, ID == "HALLMARK_TNFA_SIGNALING_VIA_NFKB") %>% select(core_enrichment) %>%
+  mutate(core_enrichment = as.list(strsplit(core_enrichment, "/")))
+hallmark.tnfa <- as.data.frame(hallmark.tnfa[[1]]) %>% mutate(Hallmark = "TNFa") %>% dplyr::rename(Genes=1)
+
+hallmarks_gsea <- rbind(hallmark.apoptosis, hallmark.tgfb, hallmark.tnfa)
+```
+
+##GO
+```{r}
+res_deg <- list(lFC_1.5 = list(down = filter(res, logFC <= -1.5 & adj.P.Val <= 0.05),
+                               up = filter(res, logFC >= 1.5 & adj.P.Val <= 0.05)),
+                lFC_2.0 = list(down = filter(res, logFC <= -2 & adj.P.Val <= 0.05),
+                               up = filter(res, logFC >= 2 & adj.P.Val <= 0.05)))
+
+
+```
+### FC |1.5|
+```{r}
+GO_down_1.5 <- enrichGO(gene = res_deg$lFC_1.5$down$ENTREZID, OrgDb = "org.Mm.eg.db", pvalueCutoff = 0.05, ont = 'all')
+GO_down_1.5@result %>% View()
+
+GO_up_1.5 <- enrichGO(gene = res_deg$lFC_1.5$up$ENTREZID, OrgDb = "org.Mm.eg.db", qvalueCutoff = 0.05, ont = 'all')
+GO_up_1.5@result %>% View()
+
+
+treeplot(pairwise_termsim(filter(GO_down_1.5)))
+#ggsave("Figuras/Treeplot GO Down lFC15.png", width = 14, height = 7, bg='white')
+treeplot(pairwise_termsim(filter(GO_up_1.5)))
+ggsave("Figuras/Treeplot GO Up lFC15.png", width = 14, height = 7, bg='white')
+
+barplot(GO_up_1.5, showCategory = 10)
+
+barplot(filter(GO_up_1.5, ONTOLOGY == 'MF'))
+ggsave("Figuras/Molecular Function UP lFC15.png", width = 6, height = 6, bg='white')
+
+barplot(filter(GO_up_1.5, ONTOLOGY == 'BP'))
+ggsave("Figuras/Biological Process UP lFC15.png", width = 6, height = 6, bg='white')
+```
+
+### FC |2.0|
+```{r}
+GO_down_2.0 <- enrichGO(gene = res_deg$lFC_2.0$down$ENTREZID, OrgDb = "org.Mm.eg.db", pvalueCutoff = 0.05, ont = 'all')
+GO_down_2.0@result %>% View()
+
+GO_up_2.0 <- enrichGO(gene = res_deg$lFC_2.0$up$ENTREZID, OrgDb = "org.Mm.eg.db", pvalueCutoff = 0.05, ont = "all")
+GO_up_2.0@result %>% View()
+
+treeplot(pairwise_termsim(filter(GO_down_2.0)))
+treeplot(pairwise_termsim(filter(GO_up_2.0)))
+
+barplot(filter(GO_up_2.0, ONTOLOGY == 'MF'))
+barplot(filter(GO_up_2.0, ONTOLOGY == 'BP'))
+```
+
+```{r}
+GO_down_1.5@result %>% filter(p.adjust <= 0.05) %>% summary(n)
+GO_down_2.0@result %>% filter(p.adjust <= 0.05) %>% summary(n)
+
+GO_up_1.5@result %>% filter(p.adjust <= 0.05) %>% summary(n)
+GO_up_2.0@result %>% filter(p.adjust <= 0.05) %>% summary(n)
+```
+
+##KEGG
+```{r}
+KEGG_up_2.0 <- enrichKEGG(gene = res_deg$lFC_2.0$up$ENTREZID, organism = "mmu", keyType = 'kegg')
+KEGG_up_2.0@result %>% View()
+
+KEGG_up_1.5 <- enrichKEGG(gene = res_deg$lFC_1.5$up$ENTREZID, organism = "mmu", keyType = 'kegg')
+KEGG_up_1.5@result %>% View()
+
+KEGG_down_2.0 <- enrichKEGG(gene = res_deg$lFC_2.0$down$ENTREZID, organism = "mmu", keyType = 'kegg')
+KEGG_down_2.0@result %>% View()
+
+KEGG_down_1.5 <- enrichKEGG(gene = res_deg$lFC_1.5$down$ENTREZID, organism = "mmu", keyType = 'kegg')
+KEGG_down_1.5@result %>% View()
+
+#treeplot(pairwise_termsim(KEGG_up_2.0))
+barplot(KEGG_down_2.0, showCategory = 10)
+barplot(KEGG_up_1.5, showCategory = 10)
+ggsave("Figuras/KEGG UP lFC20.png", width = 14, height = 7, bg='white')
+```
+
+
+#```{r}
+barplot(KEGG_up_1.5, showCategory = 10)
+barplot(KEGG_up_2.0, showCategory = 10)
+barplot(GO_up_1.5, showCategory = 10)
+barplot(GO_up_2.0, showCategory = 10)
+#```
+
+
+#GSE156380
+```{r}
+#Analise de co-cultura vs exosomo
+cc.exo_4a <- rbind(openxlsx::read.xlsx("GSE156380_DEG_miRNAs_selected.xlsx", sheet="4A2B down"),
+                                    openxlsx::read.xlsx("GSE156380_DEG_miRNAs_selected.xlsx", sheet="4A2B up"))
+
+cc.exo_8a <- rbind(openxlsx::read.xlsx("GSE156380_DEG_miRNAs_selected.xlsx", sheet="8A4B down"),
+                                    openxlsx::read.xlsx("GSE156380_DEG_miRNAs_selected.xlsx", sheet="8A4B up"))
+
+cc.exo_4a$Cel <- "4A"
+cc.exo_8a$Cel <- "8A"
+
+
+
+
+EnhancedVolcano(cc.exo_4a,
+                lab=cc.exo_4a$`miRNA(mature)`,
+                max.overlaps = Inf,
+                x="log2FoldChange", 
+                y="pvalue",
+                #colCustom = keyvals,
+                ylab = bquote(~-Log[10]~italic("P-value")),
+                FCcutoff = 2,
+                pCutoff = 0.05,
+                pCutoffCol = "padj",
+                title=NULL,
+                subtitle=NULL,
+                pointSize = 3, 
+                labSize = 4,
+                colAlpha = .8)+
+  annotate("rect", xmin = -2, xmax = -Inf,
+           ymin = 2.13, ymax = Inf,
+           alpha = .1, fill = cores[1]) +
+  annotate("rect", xmin = 2, xmax = Inf,
+           ymin = 2.13, ymax = Inf,
+           alpha = .1, fill = cores[2])+
+  theme_classic()+
+  theme(legend.position = 'top',
+        legend.title = element_blank())
+
+EnhancedVolcano(cc.exo_8a,
+                lab=cc.exo_8a$`miRNA(mature)`,
+                max.overlaps = Inf,
+                x="log2FoldChange", 
+                y="padj",
+                #colCustom = keyvals,
+                ylab = bquote(~-Log[10]~italic("P-value")),
+                FCcutoff = 2,
+                pCutoff = 0.05,
+                pCutoffCol = "padj",
+                title=NULL,
+                subtitle=NULL,
+                pointSize = 3, 
+                labSize = 4,
+                colAlpha = .8)+
+  annotate("rect", xmin = -2, xmax = -Inf,
+           ymin = 2.13, ymax = Inf,
+           alpha = .1, fill = cores[1]) +
+  annotate("rect", xmin = 2, xmax = Inf,
+           ymin = 2.13, ymax = Inf,
+           alpha = .1, fill = cores[2])+
+  theme_classic()+
+  theme(legend.position = 'top',
+        legend.title = element_blank())
+```
+
+##Unidos
+```{r}
+cc.exo <- rbind(cc.exo_4a, cc.exo_8a)
+
+
+
+shapes.volcano <- c(15, 17)
+keyvals.shape <- ifelse(cc.exo$Cel == '4A', shapes.volcano[1], shapes.volcano[2])
+
+names(keyvals.shape)[keyvals.shape == shapes.volcano[1]] <- "4A"
+names(keyvals.shape)[keyvals.shape == shapes.volcano[2]] <- "8A"
+
+keyvals.cc.exo <- ifelse(cc.exo$padj >= 0.05, "gray",
+                  ifelse(cc.exo$log2FoldChange <= -2 & cc.exo$Cel == "4A", 'purple', 
+                         ifelse(cc.exo$log2FoldChange <= -2 & cc.exo$Cel == "8A", 'purple4',
+                                ifelse(cc.exo$log2FoldChange >= 2 & cc.exo$Cel == "4A", 'orange', 
+                                       ifelse(cc.exo$log2FoldChange >= 2 & cc.exo$Cel == "8A", "orange4", "gray")))))
+
+keyvals.cc.exo <- ifelse(cc.exo$padj >= 0.05, "gray", 
+                         ifelse(cc.exo$Cel == "4A", "orange", "blue"))
+
+keyvals.cc.exo[is.na(keyvals.cc.exo)] <- "gray"
+names(keyvals.cc.exo)[keyvals.cc.exo == "orange"] <- "Up-regulated"
+names(keyvals.cc.exo)[keyvals.cc.exo == "orange4"] <- "Up-regulated2"
+names(keyvals.cc.exo)[keyvals.cc.exo == "gray"] <- "Not significant"
+names(keyvals.cc.exo)[keyvals.cc.exo == "purple"] <- "Down-regulated"
+names(keyvals.cc.exo)[keyvals.cc.exo == "purple4"] <- "Down-regulated2"
+
+
+pdf("Figuras/Volcano cc_exo 4A e 4B.pdf", width = 6, height = 5)
+EnhancedVolcano(cc.exo,
+                lab = cc.exo$`miRNA(mature)`, labSize = 3,
+                x='log2FoldChange', y='padj',
+                ylab = bquote(~-Log[10]~italic("Adj P-value")),
+                FCcutoff = 2, pCutoff = 0.05, pCutoffCol = 'padj',
+                shapeCustom = keyvals.shape, colCustom = keyvals.cc.exo,
+                pointSize = 4, colAlpha = .6,
+                drawConnectors = T,
+                title = NULL, subtitle = NULL, caption = NULL)+
+  theme_classic()+
+  theme(legend.position = 'top',
+        legend.title = element_blank())+
+    annotate("rect", xmin = -2, xmax = -Inf,
+           ymin = 1.3, ymax = Inf,
+           alpha = .1, fill = 'purple') +
+  annotate("rect", xmin = 2, xmax = Inf,
+           ymin = 1.3, ymax = Inf,
+           alpha = .1, fill = 'orange')+
+  scale_color_discrete(breaks=c('Down-regulated', 'Not significant', 'Up-regulated'), type=c('purple', 'purple4', 'gray', 'orange', "#D02F05FF"))
+
+dev.off()
+ggsave("Figuras/Volcano cc_exo 4A e 4B.png", width = 7, height = 5, bg='white')
+
+
+ggpubr::ggarrange(
+cc.exo %>% filter(padj <= 0.05 & Cel=="4A") %>% 
+  mutate(fc = ifelse(log2FoldChange <= -2, "down", ifelse(log2FoldChange >=2, "up", "n.s"))) %>% 
+  ggplot(aes(log2FoldChange, reorder(`miRNA(mature)`, log2FoldChange), fill=fc))+
+  geom_col()+
+  geom_vline(xintercept = c(-2,0,2), linetype=c('dashed', 'solid', 'dashed'), alpha=c(.5, 1, .5))+
+  labs(y=NULL, title='4A')+
+  scale_fill_manual(values=c('purple', 'gray', 'orange'), guide='none')+
+  theme_classic()+
+  theme(axis.text.y = element_text(size=10, color='black'))+
+  coord_cartesian(xlim=c(-15,25))
+,
+cc.exo %>% filter(padj <= 0.05 & Cel=="8A") %>% 
+  mutate(fc = ifelse(log2FoldChange <= -2, "down", ifelse(log2FoldChange >=2, "up", "n.s"))) %>% 
+  ggplot(aes(log2FoldChange, reorder(`miRNA(mature)`, log2FoldChange), fill=fc))+
+  geom_col()+
+  geom_vline(xintercept = c(-2,0,2), linetype=c('dashed', 'solid', 'dashed'), alpha=c(.5, 1, .5))+
+  labs(y=NULL, title='8A')+
+  scale_fill_manual(values=c('purple4', 'gray', '#D02F05FF'), guide='none')+
+  theme_classic()+
+  theme(axis.text.y = element_text(size=10, color='black'))+
+  coord_cartesian(xlim=c(-15,25))
+,
+labels="AUTO", nrow=1, ncol=2)
+
+ggsave("Figuras/miRDEGs cc_exo.png", width = 10, height = 6)
+```
+
+#miRs e Rede
+#Targets
+
+#MiRs selected
+```{r}
+mirs.selected <- openxlsx::read.xlsx('GSE156380_DEG_miRNAs_selected.xlsx', sheet='Selected', colNames = F)
+mirs.selected$X1 <- str_remove_all(mirs.selected$X1,pattern = "hsa-")
+mirs.selected[10,] <- c("miR-21a-5p", "up", "teste")
+
+
+```
+##miRTar
+```{r}
+res.deg <- res %>% filter(abs(logFC) >=1.5, adj.P.Val <=.05)
+
+mirtar <- readxl::read_xls('../miRTarBase-mmu_MTI.xls')
+mirtar <- mirtar %>% dplyr::select(miRNA, `Target Gene`) %>% unique()
+
+mirtar$miRNA <- str_remove_all(mirtar$miRNA, "mmu-")
+
+targets.mirtar <- filter(mirtar, miRNA %in% mirs.selected$X1)
+degs.mirtar <- filter(targets.mirtar, `Target Gene` %in% res.deg$SYMBOL)
+```
+
+##Targetscan
+```{r}
+targetscan <- read.delim('../TargetScan - Predicted_Targets_Context_Scores.default_predictions.txt')
+
+targetscan <- targetscan[grepl("mmu", targetscan$miRNA),]
+targetscan <- targetscan %>% dplyr::select(Gene.Symbol, miRNA)
+
+#Transformar gene symbol no formato para Mm: Primeira letra maiuscula, restante minusculo
+  ##stringr str_to_title faz essa formatação
+targetscan$Gene.Symbol <- stringr::str_to_title(targetscan$Gene.Symbol)
+targetscan <- unique(targetscan)
+
+targetscan$miRNA <- str_remove_all(targetscan$miRNA, "mmu-")
+
+miRs_up_1.5 <- filter(targetscan, Gene.Symbol %in% res_deg$lFC_1.5$up$SYMBOL)
+miRs_down_1.5 <- filter(targetscan, Gene.Symbol %in% res_deg$lFC_1.5$down$SYMBOL)
+
+miRs_up_2.0 <- filter(targetscan, Gene.Symbol %in% res_deg$lFC_2.0$up$SYMBOL)
+miRs_down_2.0 <- filter(targetscan, Gene.Symbol %in% res_deg$lFC_2.0$down$SYMBOL)
+
+miRs_2.0 <- filter(targetscan, Gene.Symbol %in% c(res_deg$lFC_2.0$down$SYMBOL, res_deg$lFC_2.0$up$SYMBOL))
+unique(miRs_2.0$Gene.Symbol)
+
+
+targets.targetscan <- filter(targetscan, miRNA %in% mirs.selected$X1)
+degs.targetscan <- filter(targets.targetscan, Gene.Symbol %in% res.deg$SYMBOL)
+
+
+
+degs.targetscan %>% colnames()
+
+degs.targetscan <- degs.targetscan %>% dplyr::select(1, 2, 4, 6, 10, 12)
+
+degs.targetscan_GO <- enrichGO(degs.targetscan$Gene.Symbol,
+                               OrgDb = org.Mm.eg.db, 
+                               keyType = 'SYMBOL',
+                               ont='all')
+
+degs.targetscan_GO@result %>% View()
+
+degs.targetscan_KEGG <- enrichKEGG(degs.targetscan$ENTREZID, organism = 'mmu', keyType = 'kegg')
+degs.targetscan_KEGG@result %>% View()
+```
+
+
+##miRDB
+```{r}
+library(multiMiR)
+
+mirdb.up <- get_multimir(org = "mmu",
+                               table = "mirdb",
+                               target = res_deg$lFC_2.0$up$SYMBOL) #lFC 2.0 nao tem os miR de interesse
+mirdb.up@data %>% View()
+
+
+mirdb.down <- get_multimir(org = "mmu",
+                               table = "mirdb",
+                               target = res_deg$lFC_1.5$down$SYMBOL)
+mirdb.down@data %>% View()
+
+table(miRs_up_1.5$Gene.Symbol)
+
+mirdb.degs <- get_multimir(org='mmu',
+                           table = 'mirdb',
+                           target=res.deg$SYMBOL)
+
+mirdb.degs <- mirdb.degs@data
+mirdb.degs$mature_mirna_id <- str_remove_all(mirdb.degs$mature_mirna_id, 'mmu-')
+
+targets.mirdb <- filter(mirdb.degs, mature_mirna_id %in% mirs.selected$X1)
+
+targets.mirdb <- targets.mirdb %>% dplyr::rename(Gene.Symbol=target_symbol, miRNA = mature_mirna_id)
+targets.selected <- rbind(degs.targetscan[c("Gene.Symbol", "miRNA")], targets.mirdb[c("Gene.Symbol", "miRNA")])
+
+targets.selected <- left_join(targets.selected, res.deg, by=c("Gene.Symbol" = "SYMBOL")) %>% 
+  mutate(fc=ifelse(logFC < 0, 'down', 'up'))
+
+colnames(targets.selected)
+targets.selected %>% dplyr::select(1,2,12) %>% distinct() %>% openxlsx::write.xlsx(.,'DEGs alvos de miRs selecionadas.xlsx' )
+
+openxlsx::write.xlsx(targets.selected, 'DEGs alvos de miRs selecionadas.xlsx')
+```
+
+##Enriquecimento
+```{r}
+targets.selected_GO <- enrichGO(targets.selected$Gene.Symbol,
+                               OrgDb = org.Mm.eg.db, 
+                               keyType = 'SYMBOL',
+                               ont='all')
+targets.selected_GO <- targets.selected_GO@result
+openxlsx::write.xlsx(targets.selected_GO, "Figuras/GO Alvos rede.xlsx", asTable = T)
+
+targets.selected_KEGG <- enrichKEGG(targets.selected$ENTREZID, organism = 'mmu', keyType = 'kegg')
+targets.selected_KEGG@result %>% openxlsx::write.xlsx(., 'Figuras/KEGG alvos rede.xlsx', asTable=T)
+```
+
+```{r}
+miRs_up_1.5$conc <- paste(miRs_up_1.5$Gene.Symbol, miRs_up_1.5$miRNA, sep='*')
+mirdb.up@data$conc <- paste(mirdb.up@data$target_symbol, mirdb.up@data$mature_mirna_id, sep = '*')
+
+conc <- inner_join(miRs_up_1.5, mirdb.up@data)
+
+openxlsx::write.xlsx(conc, "mirdb e targetscan.xlsx")
+```
+
+
+
